@@ -1,0 +1,196 @@
+name: Manual CI/CD Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+        default: development
+        required: true
+      run_tests:
+        description: 'Run test suite'
+        type: boolean
+        default: true
+      run_build:
+        description: 'Build application'
+        type: boolean
+        default: true
+      deploy:
+        description: 'Deploy to environment'
+        type: boolean
+        default: false
+      build_version:
+        description: 'Custom build version (optional)'
+        type: string
+        required: false
+
+env:
+  NODE_VERSION: '18'
+
+jobs:
+  info:
+    runs-on: ubuntu-latest
+    outputs:
+      timestamp: ${{ steps.info.outputs.timestamp }}
+    steps:
+      - name: Display trigger information
+        id: info
+        run: |
+          echo "🚀 Manual Pipeline Triggered"
+          echo "================================"
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Run Tests: ${{ inputs.run_tests }}"
+          echo "Run Build: ${{ inputs.run_build }}"
+          echo "Deploy: ${{ inputs.deploy }}"
+          echo "Build Version: ${{ inputs.build_version || 'default' }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "timestamp=$(date -u +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+
+  setup:
+    runs-on: ubuntu-latest
+    needs: info
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      
+      - name: Install dependencies
+        run: npm ci --prefer-offline --no-audit
+      
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ env.NODE_VERSION }}-${{ hashFiles('package-lock.json') }}
+
+  test:
+    runs-on: ubuntu-latest
+    needs: setup
+    if: inputs.run_tests == true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      
+      - name: Restore dependencies
+        run: npm ci --prefer-offline --no-audit
+      
+      - name: Run tests
+        run: npm test
+      
+      - name: Test summary
+        if: always()
+        run: |
+          echo "✅ Tests completed"
+          echo "Environment: ${{ inputs.environment }}"
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [setup, test]
+    if: always() && inputs.run_build == true && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    outputs:
+      build_size: ${{ steps.build_info.outputs.size }}
+      build_id: ${{ steps.build_info.outputs.build_id }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      
+      - name: Restore dependencies
+        run: npm ci --prefer-offline --no-audit
+      
+      - name: Build application
+        env:
+          BUILD_TIME: ${{ needs.info.outputs.timestamp }}
+          NODE_ENV: ${{ inputs.environment }}
+        run: npm run build
+      
+      - name: Build information
+        id: build_info
+        run: |
+          SIZE=$(du -sh dist | cut -f1)
+          BUILD_ID="${{ inputs.build_version || needs.info.outputs.timestamp }}"
+          echo "size=$SIZE" >> $GITHUB_OUTPUT
+          echo "build_id=$BUILD_ID" >> $GITHUB_OUTPUT
+          echo "📦 Build Size: $SIZE"
+          echo "🏷️ Build ID: $BUILD_ID"
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ inputs.environment }}-${{ needs.info.outputs.timestamp }}
+          path: dist/
+          retention-days: 7
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [info, build]
+    if: inputs.deploy == true && needs.build.result == 'success'
+    environment:
+      name: ${{ inputs.environment }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-${{ inputs.environment }}-${{ needs.info.outputs.timestamp }}
+          path: deploy/
+      
+      - name: Deploy to ${{ inputs.environment }}
+        run: |
+          echo "🚀 Deploying to ${{ inputs.environment }} environment"
+          echo "Build ID: ${{ needs.build.outputs.build_id }}"
+          echo "Build Size: ${{ needs.build.outputs.build_size }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo ""
+          echo "Deployment files:"
+          ls -lah deploy/
+          echo ""
+          echo "✅ Deployment to ${{ inputs.environment }} completed successfully"
+          # Add your actual deployment commands here
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: [info, test, build, deploy]
+    if: always()
+    steps:
+      - name: Pipeline summary
+        run: |
+          echo "# Manual Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp**: ${{ needs.info.outputs.timestamp }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Job Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Setup**: ${{ needs.info.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tests**: ${{ needs.test.result || 'skipped' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build**: ${{ needs.build.result || 'skipped' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deploy**: ${{ needs.deploy.result || 'skipped' }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.build.result }}" = "success" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## Build Information" >> $GITHUB_STEP_SUMMARY
+            echo "- **Build Size**: ${{ needs.build.outputs.build_size }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Build ID**: ${{ needs.build.outputs.build_id }}" >> $GITHUB_STEP_SUMMARY
+          fi
